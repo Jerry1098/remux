@@ -1948,6 +1948,23 @@ async fn item_for_user(
             )
             .await?;
     }
+    // A Source row stands in for its parent in client UIs: jellyfin-web builds the
+    // item context menu from the version picker's selected id, which for every
+    // version past the first is the child Stream row. Borrow the parent's kind so
+    // the DTO still carries CanDownload/MediaSources/MediaType and the parent's
+    // item Type — audio parents keep audio semantics, which hardcoding Video here
+    // would break.
+    if media.kind == db::MediaKind::Stream
+        && let Some(parent) = media
+            .parent(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await?
+    {
+        media.kind = parent.kind;
+    }
     // info!("Seasons length: {:?}", media.seasons(&state.ctx.db).await?.len());
     media
         .load_relations(
@@ -5722,6 +5739,67 @@ mod tests {
                 .simple()
                 .to_string(),
             "the item itself is still the parent movie"
+        );
+    }
+
+    /// jellyfin-web builds the item context menu from the *selected version's*
+    /// id, and for every version past the first that id is the child Stream row.
+    /// Its DTO must still look like playable content, or Download, Media Info
+    /// and Edit subtitles all disappear from the menu.
+    #[tokio::test]
+    async fn items_get_by_stream_row_id_keeps_its_parents_item_shape() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let now = Utc::now().naive_utc();
+
+        let episode = crate::integration_test::seed_episode(ctx).await;
+        let filename = "TestEpisode.S01E01.1080p.WEB-DL.mkv";
+        let mut stream = db::Media {
+            title: filename.to_string(),
+            kind: db::MediaKind::Stream,
+            parent_id: Some(episode.id),
+            idx: Some(1),
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Local(filename.into()),
+                filename: Some(filename.to_string()),
+                ..Default::default()
+            }),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        stream
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let resp = server
+            .get(&format!("/items/{}", stream.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+
+        assert_eq!(body["CanDownload"], serde_json::json!(true));
+        assert_eq!(body["MediaType"], serde_json::json!("Video"));
+        assert_eq!(body["Type"], serde_json::json!("Episode"));
+        let sources = body["MediaSources"]
+            .as_array()
+            .expect("a version row must carry itself as a MediaSource");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0]["Id"]
+                .as_str()
+                .unwrap(),
+            stream
+                .id
+                .simple()
+                .to_string(),
+            "the source is the row itself, so its id must stay the stream id"
         );
     }
 

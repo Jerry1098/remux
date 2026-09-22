@@ -1641,6 +1641,92 @@ fn rank_item_sources(
     });
 }
 
+/// The source `/items/{id}` lists first — the one the detail page shows and
+/// PlaybackInfo auto-plays.
+///
+/// A download names only the *item* id (jellyfin-web's download URL carries no
+/// MediaSourceId), and the stream lookup answers an item id with `streams()`'
+/// raw `idx` order — the addon's order, not the ranked order the client was
+/// shown. Without this the file served is not the version the client listed.
+pub(crate) async fn default_source_for_item(
+    state: &AppState,
+    session: &auth::AuthSession,
+    id: Uuid,
+) -> Option<Uuid> {
+    let pool = &state
+        .ctx
+        .db;
+    let mut media = db::Media::get_by_id(pool, &id)
+        .await
+        .ok()
+        .flatten()?;
+    if !matches!(
+        media.kind,
+        db::MediaKind::Movie | db::MediaKind::Episode | db::MediaKind::Track
+    ) {
+        return None;
+    }
+    // The same refresh the stream lookup runs before it resolves, so the id
+    // picked here still exists by the time it gets there. TTL-guarded, so the
+    // lookup's own call is then a no-op.
+    state
+        .ctx
+        .addons
+        .refresh_streams(
+            &mut media,
+            &state.ctx,
+            Some(
+                session
+                    .user
+                    .id,
+            ),
+        )
+        .await
+        .log_err("failed to refresh sources");
+    let mut sources = media
+        .streams(pool)
+        .await
+        .ok()?;
+    let server_config = db::Settings::get_config_or_default(pool).await;
+    let encoding_cfg = db::Settings::get_encoding_config(pool)
+        .await
+        .unwrap_or_default();
+    let user_cfg = session
+        .user
+        .configuration
+        .as_ref()
+        .map(|c| {
+            c.0.clone()
+        })
+        .unwrap_or_default();
+    let device_profile = session
+        .device
+        .parsed_device_profile();
+    rank_item_sources(
+        &mut sources,
+        SourceRankingContext {
+            mode: server_config
+                .sort_media_sources
+                .unwrap_or_default(),
+            device_profile: device_profile.as_ref(),
+            subtitle_mode: encoding_cfg
+                .subtitle_mode
+                .unwrap_or_default(),
+            explicit_subtitle_index: None,
+        },
+        &user_cfg,
+        server_config
+            .preferred_metadata_language
+            .as_deref(),
+        media
+            .original_language
+            .as_deref(),
+    );
+    sources
+        .first()
+        .map(|s| s.id)
+}
+
 async fn item_for_user(
     state: AppState,
     session: auth::AuthSession,

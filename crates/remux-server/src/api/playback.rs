@@ -763,6 +763,15 @@ pub async fn items_file(
     Query(mut q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
     q.static_ = Some(true);
+    // A download URL names the item, never a MediaSourceId, so the lookup below
+    // would answer it with the addon's raw order instead of the version the
+    // client listed first (issue #449). Name that version explicitly.
+    if q.media_source_id
+        .is_none()
+    {
+        q.media_source_id =
+            crate::api::items::default_source_for_item(&state, &session, id).await;
+    }
     let filename = db::Media::get_by_id(
         &state
             .ctx
@@ -1510,6 +1519,126 @@ mod tests {
         tokio::fs::remove_file(fixture)
             .await
             .unwrap();
+    }
+
+    /// A download URL carries no MediaSourceId, so the item id alone has to
+    /// resolve to the version the client was shown — the ranked-first source,
+    /// not the addon's first. Regression test for issue #449.
+    #[tokio::test]
+    async fn item_download_serves_the_version_the_client_lists_first() {
+        use crate::{
+            api::{MediaSourceInfo, MediaStream, MediaStreamType},
+            db, stream,
+        };
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let now = chrono::Utc::now().naive_utc();
+
+        let mut fixtures = Vec::new();
+        for body in ["addon-order-first", "ranked-first"] {
+            let path = std::env::temp_dir()
+                .join(format!("remux-449-{}.mkv", uuid::Uuid::new_v4()));
+            tokio::fs::write(&path, body.as_bytes())
+                .await
+                .unwrap();
+            fixtures.push(path);
+        }
+
+        let imdb = db::NonEmptyString::try_new("tt4490001".to_string()).unwrap();
+        let mut movie = db::Media {
+            title: "Ranked Download".to_string(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                imdb: Some(imdb),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        movie
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        // Keeps `refresh_streams` off the addons and `streams()` from dropping
+        // rows as pre-refresh leftovers.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(movie.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+
+        // idx 0 is the addon's first result but the worse version: ranking must
+        // move the 1080p source ahead of it.
+        for (idx, (width, height, bitrate)) in
+            [(854, 480, 1_000_000), (1920, 1080, 8_000_000)]
+                .into_iter()
+                .enumerate()
+        {
+            let mut source = db::Media {
+                title: format!("source-{idx}"),
+                kind: db::MediaKind::Stream,
+                parent_id: Some(movie.id),
+                idx: Some(idx as i64),
+                stream_info: Some(stream::StreamInfo {
+                    descriptor: stream::StreamDescriptor::Local(fixtures[idx].clone()),
+                    ..Default::default()
+                }),
+                probe_data: Some(MediaSourceInfo {
+                    container: Some(VideoContainer::Mkv),
+                    bitrate: Some(bitrate),
+                    media_streams: vec![
+                        MediaStream {
+                            codec: Some("h264".to_string()),
+                            ref_frames: Some(1),
+                            type_: Some(MediaStreamType::Video),
+                            index: 0,
+                            width: Some(width),
+                            height: Some(height),
+                            ..Default::default()
+                        },
+                        MediaStream {
+                            codec: Some("aac".to_string()),
+                            type_: Some(MediaStreamType::Audio),
+                            index: 1,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            source
+                .save(&ctx.db)
+                .await
+                .unwrap();
+        }
+
+        let auth = auth_header_with_token(&token);
+        let response = server
+            .get(&format!("/items/{}/download", movie.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        response.assert_status_ok();
+        assert_eq!(
+            response.text(),
+            "ranked-first",
+            "the download must be the source the item page lists first"
+        );
+
+        for fixture in fixtures {
+            tokio::fs::remove_file(fixture)
+                .await
+                .unwrap();
+        }
     }
 
     #[test]

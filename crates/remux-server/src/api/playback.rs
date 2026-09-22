@@ -763,14 +763,27 @@ pub async fn items_file(
     Query(mut q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
     q.static_ = Some(true);
-    // A download URL names the item, never a MediaSourceId, so the lookup below
-    // would answer it with the addon's raw order instead of the version the
-    // client listed first (issue #449). Name that version explicitly.
+    // No MediaSourceId: serve the item page's first source (its Path holds the stream id).
     if q.media_source_id
         .is_none()
     {
+        let fields = [api::ItemFields::MediaSources];
         q.media_source_id =
-            crate::api::items::default_source_for_item(&state, &session, id).await;
+            crate::api::items::item(state.clone(), session.clone(), id, Some(&fields))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|item| {
+                    item.media_sources?
+                        .first()?
+                        .path
+                        .as_deref()?
+                        .strip_prefix("/remux/")?
+                        .split('/')
+                        .next()?
+                        .parse()
+                        .ok()
+                });
     }
     let filename = db::Media::get_by_id(
         &state
@@ -1521,9 +1534,7 @@ mod tests {
             .unwrap();
     }
 
-    /// A download URL carries no MediaSourceId, so the item id alone has to
-    /// resolve to the version the client was shown — the ranked-first source,
-    /// not the addon's first. Regression test for issue #449.
+    /// Downloading by item id serves the ranked-first source (#449).
     #[tokio::test]
     async fn item_download_serves_the_version_the_client_lists_first() {
         use crate::{
@@ -1561,8 +1572,7 @@ mod tests {
             .save(&ctx.db)
             .await
             .unwrap();
-        // Keeps `refresh_streams` off the addons and `streams()` from dropping
-        // rows as pre-refresh leftovers.
+        // Skip addon refresh.
         sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
             .bind(now)
             .bind(movie.id)
@@ -1570,8 +1580,7 @@ mod tests {
             .await
             .unwrap();
 
-        // idx 0 is the addon's first result but the worse version: ranking must
-        // move the 1080p source ahead of it.
+        // idx 0 is the worse version; ranking must put 1080p first.
         for (idx, (width, height, bitrate)) in
             [(854, 480, 1_000_000), (1920, 1080, 8_000_000)]
                 .into_iter()

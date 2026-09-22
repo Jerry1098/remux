@@ -1641,92 +1641,6 @@ fn rank_item_sources(
     });
 }
 
-/// The source `/items/{id}` lists first — the one the detail page shows and
-/// PlaybackInfo auto-plays.
-///
-/// A download names only the *item* id (jellyfin-web's download URL carries no
-/// MediaSourceId), and the stream lookup answers an item id with `streams()`'
-/// raw `idx` order — the addon's order, not the ranked order the client was
-/// shown. Without this the file served is not the version the client listed.
-pub(crate) async fn default_source_for_item(
-    state: &AppState,
-    session: &auth::AuthSession,
-    id: Uuid,
-) -> Option<Uuid> {
-    let pool = &state
-        .ctx
-        .db;
-    let mut media = db::Media::get_by_id(pool, &id)
-        .await
-        .ok()
-        .flatten()?;
-    if !matches!(
-        media.kind,
-        db::MediaKind::Movie | db::MediaKind::Episode | db::MediaKind::Track
-    ) {
-        return None;
-    }
-    // The same refresh the stream lookup runs before it resolves, so the id
-    // picked here still exists by the time it gets there. TTL-guarded, so the
-    // lookup's own call is then a no-op.
-    state
-        .ctx
-        .addons
-        .refresh_streams(
-            &mut media,
-            &state.ctx,
-            Some(
-                session
-                    .user
-                    .id,
-            ),
-        )
-        .await
-        .log_err("failed to refresh sources");
-    let mut sources = media
-        .streams(pool)
-        .await
-        .ok()?;
-    let server_config = db::Settings::get_config_or_default(pool).await;
-    let encoding_cfg = db::Settings::get_encoding_config(pool)
-        .await
-        .unwrap_or_default();
-    let user_cfg = session
-        .user
-        .configuration
-        .as_ref()
-        .map(|c| {
-            c.0.clone()
-        })
-        .unwrap_or_default();
-    let device_profile = session
-        .device
-        .parsed_device_profile();
-    rank_item_sources(
-        &mut sources,
-        SourceRankingContext {
-            mode: server_config
-                .sort_media_sources
-                .unwrap_or_default(),
-            device_profile: device_profile.as_ref(),
-            subtitle_mode: encoding_cfg
-                .subtitle_mode
-                .unwrap_or_default(),
-            explicit_subtitle_index: None,
-        },
-        &user_cfg,
-        server_config
-            .preferred_metadata_language
-            .as_deref(),
-        media
-            .original_language
-            .as_deref(),
-    );
-    sources
-        .first()
-        .map(|s| s.id)
-}
-
 async fn item_for_user(
     state: AppState,
     session: auth::AuthSession,
@@ -2034,12 +1948,7 @@ async fn item_for_user(
             )
             .await?;
     }
-    // A Source row stands in for its parent in client UIs: jellyfin-web builds the
-    // item context menu from the version picker's selected id, which for every
-    // version past the first is the child Stream row. Borrow the parent's kind so
-    // the DTO still carries CanDownload/MediaSources/MediaType and the parent's
-    // item Type — audio parents keep audio semantics, which hardcoding Video here
-    // would break.
+    // jellyfin-web opens non-first versions by stream id: present them as the parent item.
     if media.kind == db::MediaKind::Stream
         && let Some(parent) = media
             .parent(
@@ -2050,6 +1959,10 @@ async fn item_for_user(
             .await?
     {
         media.kind = parent.kind;
+        media.parent_id = parent.parent_id;
+        media.grandparent_id = parent.grandparent_id;
+        media.idx = parent.idx;
+        media.parent_idx = parent.parent_idx;
     }
     // info!("Seasons length: {:?}", media.seasons(&state.ctx.db).await?.len());
     media
@@ -5828,10 +5741,7 @@ mod tests {
         );
     }
 
-    /// jellyfin-web builds the item context menu from the *selected version's*
-    /// id, and for every version past the first that id is the child Stream row.
-    /// Its DTO must still look like playable content, or Download, Media Info
-    /// and Edit subtitles all disappear from the menu.
+    /// A version fetched by stream id must look like its parent (context menu actions).
     #[tokio::test]
     async fn items_get_by_stream_row_id_keeps_its_parents_item_shape() {
         let (server, guard, token) = authenticated_server().await;
@@ -5845,7 +5755,7 @@ mod tests {
             title: filename.to_string(),
             kind: db::MediaKind::Stream,
             parent_id: Some(episode.id),
-            idx: Some(1),
+            idx: Some(2),
             stream_info: Some(crate::stream::StreamInfo {
                 descriptor: crate::stream::StreamDescriptor::Local(filename.into()),
                 filename: Some(filename.to_string()),
@@ -5873,6 +5783,27 @@ mod tests {
         assert_eq!(body["CanDownload"], serde_json::json!(true));
         assert_eq!(body["MediaType"], serde_json::json!("Video"));
         assert_eq!(body["Type"], serde_json::json!("Episode"));
+        assert_eq!(
+            body["SeasonId"],
+            serde_json::json!(
+                episode
+                    .parent_id
+                    .unwrap()
+                    .simple()
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            body["SeriesId"],
+            serde_json::json!(
+                episode
+                    .grandparent_id
+                    .unwrap()
+                    .simple()
+                    .to_string()
+            )
+        );
+        assert_eq!(body["IndexNumber"], serde_json::json!(episode.idx));
         let sources = body["MediaSources"]
             .as_array()
             .expect("a version row must carry itself as a MediaSource");

@@ -6798,9 +6798,14 @@ impl Media {
             .iter_mut()
             .flatten()
         {
-            source.runtime = source
-                .runtime
-                .or(self.runtime);
+            if let Some(info) = source
+                .stream_info
+                .as_mut()
+            {
+                info.runtime = source
+                    .runtime
+                    .or(self.runtime);
+            }
         }
         Ok(self
             .sources
@@ -7384,6 +7389,7 @@ impl From<sdks::stremio::Stream> for Media {
             torrent_file_idx: None,
             service_id: None,
             service_cached: source.cached_status(),
+            runtime: None,
         });
 
         // Merge name + description: AIOStreams puts the provider/addon name in `name`

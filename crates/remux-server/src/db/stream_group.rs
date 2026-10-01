@@ -267,11 +267,10 @@ impl StreamGroup {
                     s.stream_info
                         .as_ref()
                         .map_or(false, |info| {
-                            group.match_stream(
+                            group.match_outcome(
                                 info,
                                 s.probe_data
                                     .as_ref(),
-                                s.runtime,
                             ) == MatchOutcome::Match
                         })
                 })
@@ -333,11 +332,10 @@ pub fn apply_stream_filter(filter: &StreamFilter, sources: Vec<Media>) -> Vec<Me
             s.stream_info
                 .as_ref()
                 .map_or(true, |info| {
-                    temp.match_stream(
+                    temp.match_outcome(
                         info,
                         s.probe_data
                             .as_ref(),
-                        s.runtime,
                     ) != MatchOutcome::NoMatch
                 })
         })
@@ -345,21 +343,10 @@ pub fn apply_stream_filter(filter: &StreamFilter, sources: Vec<Media>) -> Vec<Me
 }
 
 impl StreamGroup {
-    #[cfg(test)]
     pub fn match_outcome(
         &self,
         info: &StreamInfo,
         probe_data: Option<&crate::api::MediaSourceInfo>,
-    ) -> MatchOutcome {
-        self.match_stream(info, probe_data, None)
-    }
-
-    /// `runtime_secs` feeds the Bitrate rule's size ÷ runtime estimate.
-    pub fn match_stream(
-        &self,
-        info: &StreamInfo,
-        probe_data: Option<&crate::api::MediaSourceInfo>,
-        runtime_secs: Option<i64>,
     ) -> MatchOutcome {
         let filter = &self.filter;
         if filter
@@ -450,7 +437,9 @@ impl StreamGroup {
                     let bitrate = probe_data
                         .and_then(|p| p.bitrate)
                         .or_else(|| {
-                            let secs = runtime_secs.filter(|s| *s > 0)?;
+                            let secs = info
+                                .runtime
+                                .filter(|s| *s > 0)?;
                             Some(info.size? * 8 / secs)
                         });
                     match bitrate {
@@ -516,11 +505,10 @@ impl StreamGroup {
                 s.stream_info
                     .as_ref()
                     .map_or(false, |info| {
-                        group.match_stream(
+                        group.match_outcome(
                             info,
                             s.probe_data
                                 .as_ref(),
-                            s.runtime,
                         ) == MatchOutcome::Match
                     })
             })
@@ -1247,7 +1235,10 @@ mod tests {
             op: NumericOp::Lt,
             value: 8_000_000,
         }];
-        let file = |size| info_with_size("Movie.1080p.WEB-DL.mkv", size);
+        let file = |size, runtime| StreamInfo {
+            runtime,
+            ..info_with_size("Movie.1080p.WEB-DL.mkv", size)
+        };
         let probe = crate::api::MediaSourceInfo {
             bitrate: Some(20_000_000),
             ..Default::default()
@@ -1267,7 +1258,7 @@ mod tests {
             (Some(2 * GIB), None, None, MatchOutcome::PassThrough),
         ];
         for (size, probe, runtime, want) in cases {
-            assert_eq!(group.match_stream(&file(size), probe, runtime), want);
+            assert_eq!(group.match_outcome(&file(size, runtime), probe), want);
         }
     }
 

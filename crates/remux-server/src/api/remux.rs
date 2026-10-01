@@ -482,11 +482,10 @@ async fn streams_metadata(state: &AppState, id: Uuid) -> AnyResult<StreamsRespon
                 s.stream_info
                     .as_ref()
                     .map_or(false, |info| {
-                        group.match_stream(
+                        group.match_outcome(
                             info,
                             s.probe_data
                                 .as_ref(),
-                            s.runtime,
                         ) == db::MatchOutcome::Match
                     })
             })

@@ -363,6 +363,9 @@ pub struct StreamInfo {
     pub seeders: Option<i64>,
     pub size: Option<i64>,
     pub duration: Option<i64>,
+    /// Parent item's runtime (seconds), filled in-memory for the Bitrate rule.
+    #[serde(skip)]
+    pub runtime: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtitles: Vec<crate::sdks::stremio::Subtitle>,
     /// Catchup URL template from M3U `catchup-source` attribute.

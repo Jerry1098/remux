@@ -226,9 +226,14 @@ pub async fn stream_group_preview(
         )
         .await?;
     for s in &mut raw_streams {
-        s.runtime = s
-            .runtime
-            .or(stub.runtime);
+        if let Some(info) = s
+            .stream_info
+            .as_mut()
+        {
+            info.runtime = s
+                .runtime
+                .or(stub.runtime);
+        }
     }
 
     let groups = StreamGroup::list(
@@ -252,11 +257,10 @@ pub async fn stream_group_preview(
                 s.stream_info
                     .as_ref()
                     .map_or(false, |info| {
-                        group.match_stream(
+                        group.match_outcome(
                             info,
                             s.probe_data
                                 .as_ref(),
-                            s.runtime,
                         ) == MatchOutcome::Match
                     })
             })
